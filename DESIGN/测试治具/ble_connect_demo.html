@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>DCX 智能井盖 · BLE 连机验证 Demo v0.1</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; margin: 16px; background:#f5f6f7; color:#222; }
+  h2 { margin: 0 0 4px 0; }
+  .sub { color:#777; font-size:13px; margin-bottom:12px; }
+  .panel { background:#fff; border:1px solid #ddd; border-radius:6px; padding:12px; margin-bottom:12px; }
+  button { padding:6px 14px; margin-right:8px; cursor:pointer; }
+  input[type=text] { padding:5px; width:220px; }
+  select { padding:5px; max-width:480px; }
+  #status { font-weight:bold; }
+  .ok { color:#0a7d32; } .bad { color:#c0392b; } .warn { color:#b8860b; }
+  #tree { font-family: Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap; }
+  #log { font-family: Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap; background:#111; color:#9fefb0; padding:8px; height:320px; overflow-y:auto; border-radius:4px; }
+  .svc { color:#1a5276; font-weight:bold; }
+  .chr { margin-left:16px; }
+  label { font-size:13px; }
+  .row { margin:6px 0; }
+</style>
+</head>
+<body>
+<h2>BLE 连机验证 Demo <span style="font-size:13px;color:#999">v0.1 · 仅验证用</span></h2>
+<div class="sub">德创鑫智能井盖主板 · 目标：连上样机 → 枚举服务 → 读出原始数据（帧格式待客户提供后再解析）</div>
+
+<div class="panel">
+  <div class="row">
+    <label>设备名过滤（可留空=列出全部）：</label>
+    <input type="text" id="namePrefix" placeholder="例如 GJYF / DCX，留空扫全部">
+  </div>
+  <div class="row">
+    <button id="btnConnect">扫描并连接</button>
+    <button id="btnDisconnect" disabled>断开</button>
+    <button id="btnReadAll" disabled>再读一遍所有可读特征</button>
+    <span>状态：<span id="status" class="bad">未连接</span></span>
+  </div>
+  <div class="row" id="devInfo" style="color:#555;font-size:13px;"></div>
+</div>
+
+<div class="panel">
+  <b>服务 / 特征值结构</b>
+  <div id="tree">（连接后显示）</div>
+</div>
+
+<div class="panel">
+  <b>发送命令（可选，有些模块要先发查询命令才回数据）</b>
+  <div class="row">
+    <select id="writeChar"><option>（连接后列出可写特征）</option></select>
+  </div>
+  <div class="row">
+    <label>HEX 数据（空格分隔）：</label>
+    <input type="text" id="writeData" placeholder="例如 AA 01 00 55">
+    <button id="btnWrite" disabled>发送</button>
+    <label><input type="checkbox" id="asText"> 按 ASCII 文本发送</label>
+  </div>
+</div>
+
+<div class="panel">
+  <b>数据日志</b>
+  <button id="btnClear" style="float:right">清空</button>
+  <button id="btnSave" style="float:right">导出日志</button>
+  <div id="log"></div>
+</div>
+
+<script>
+"use strict";
+let device = null, server = null;
+let readableChars = [], writableChars = [], notifyChars = [];
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+
+function ts() {
+  const d = new Date();
+  return d.toTimeString().slice(0,8) + "." + String(d.getMilliseconds()).padStart(3,"0");
+}
+function log(msg, cls) {
+  const line = `[${ts()}] ${msg}\n`;
+  logEl.textContent += line;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function toHex(dv) {
+  const a = [];
+  for (let i = 0; i < dv.byteLength; i++) a.push(dv.getUint8(i).toString(16).padStart(2,"0").toUpperCase());
+  return a.join(" ");
+}
+function toAscii(dv) {
+  let s = "";
+  for (let i = 0; i < dv.byteLength; i++) {
+    const c = dv.getUint8(i);
+    s += (c >= 32 && c < 127) ? String.fromCharCode(c) : ".";
+  }
+  return s;
+}
+function shortUuid(u) {
+  // 0000xxxx-0000-1000-8000-00805f9b34fb -> 0xXXXX
+  const m = /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/.exec(u);
+  return m ? "0x" + m[1].toUpperCase() : u;
+}
+function setStatus(text, cls) {
+  $("status").textContent = text;
+  $("status").className = cls;
+}
+
+// ---- 构造 optionalServices：Web Bluetooth 只能访问事先声明的服务 ----
+// 由于还没拿到客户的服务 UUID，这里把标准服务段 + 常见厂商 16bit 段 + 常见透传 128bit UUID 全部声明一遍
+function buildOptionalServices() {
+  const list = [];
+  const blocked = new Set([0x1812, 0xFFFD]); // HID 与 FIDO 被浏览器屏蔽，不能申请
+  for (let u = 0x1800; u <= 0x18FF; u++) if (!blocked.has(u)) list.push(u);
+  for (let u = 0xFE00; u <= 0xFFFF; u++) if (!blocked.has(u)) list.push(u);
+  // 常见透传服务（Nordic UART / Microchip ISSC / TI / 常见国产模块）
+  list.push(
+    "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
+    "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+    "0000fff0-0000-1000-8000-00805f9b34fb",
+    "0003cdd0-0000-1000-8000-00805f9b0131"
+  );
+  return list;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    alert("此浏览器不支持 Web Bluetooth。请在 Mac 上用 Chrome 或 Edge 打开本页（Safari 不支持）。");
+    return;
+  }
+  const prefix = $("namePrefix").value.trim();
+  const opts = { optionalServices: buildOptionalServices() };
+  if (prefix) opts.filters = [{ namePrefix: prefix }];
+  else opts.acceptAllDevices = true;
+
+  try {
+    log("打开扫描窗口，请在弹窗中选择样机…");
+    device = await navigator.bluetooth.requestDevice(opts);
+  } catch (e) {
+    log("未选择设备或扫描被取消：" + e.message);
+    return;
+  }
+
+  device.addEventListener("gattserverdisconnected", () => {
+    setStatus("已断开", "bad");
+    $("btnDisconnect").disabled = true;
+    $("btnReadAll").disabled = true;
+    $("btnWrite").disabled = true;
+    log("!! GATT 连接已断开");
+  });
+
+  try {
+    setStatus("连接中…", "warn");
+    log(`选中设备：name=「${device.name || "(无名)"}」 id=${device.id}`);
+    log("注意：macOS 上拿不到真实 MAC，只有浏览器生成的随机 id，绑定板卡后续要靠 SN/广播名。");
+    server = await device.gatt.connect();
+    setStatus("已连接：" + (device.name || device.id), "ok");
+    $("devInfo").textContent = `设备名：${device.name || "(无名)"} ｜ 浏览器 id：${device.id}`;
+    $("btnDisconnect").disabled = false;
+    log("GATT 连接成功，开始枚举服务…");
+    await enumerate();
+  } catch (e) {
+    setStatus("连接失败", "bad");
+    log("连接失败：" + e.message);
+  }
+}
+
+async function enumerate() {
+  readableChars = []; writableChars = []; notifyChars = [];
+  let treeText = "";
+  let services;
+  try {
+    services = await server.getPrimaryServices();
+  } catch (e) {
+    log("枚举服务失败：" + e.message);
+    log("如果这里失败，多半是服务 UUID 不在声明列表里 —— 把 nRF Connect 看到的服务 UUID 告诉我，我加进去。");
+    return;
+  }
+  log(`发现 ${services.length} 个可访问服务`);
+  for (const svc of services) {
+    treeText += `服务 ${shortUuid(svc.uuid)}\n`;
+    let chars = [];
+    try { chars = await svc.getCharacteristics(); } catch (e) { treeText += `  （读特征失败：${e.message}）\n`; }
+    for (const ch of chars) {
+      const p = ch.properties;
+      const props = [
+        p.read ? "read" : "", p.write ? "write" : "", p.writeWithoutResponse ? "writeNR" : "",
+        p.notify ? "notify" : "", p.indicate ? "indicate" : ""
+      ].filter(Boolean).join(",");
+      treeText += `  └ 特征 ${shortUuid(ch.uuid)}  [${props}]\n`;
+      if (p.read) readableChars.push(ch);
+      if (p.write || p.writeWithoutResponse) writableChars.push(ch);
+      if (p.notify || p.indicate) notifyChars.push(ch);
+    }
+  }
+  $("tree").textContent = treeText || "（未发现服务）";
+
+  // 填充可写特征下拉框
+  const sel = $("writeChar");
+  sel.innerHTML = "";
+  writableChars.forEach((ch, i) => {
+    const o = document.createElement("option");
+    o.value = i;
+    o.textContent = `${shortUuid(ch.service.uuid)} / ${shortUuid(ch.uuid)}` + (ch.properties.writeWithoutResponse ? " (writeNR)" : "");
+    sel.appendChild(o);
+  });
+  $("btnWrite").disabled = writableChars.length === 0;
+  $("btnReadAll").disabled = false;
+
+  // 订阅所有 notify / indicate
+  for (const ch of notifyChars) {
+    try {
+      await ch.startNotifications();
+      ch.addEventListener("characteristicvaluechanged", ev => {
+        const dv = ev.target.value;
+        log(`NOTIFY ${shortUuid(ev.target.uuid)} (${dv.byteLength}B)\n  HEX  : ${toHex(dv)}\n  ASCII: ${toAscii(dv)}`);
+      });
+      log(`已订阅 notify：${shortUuid(ch.uuid)}`);
+    } catch (e) {
+      log(`订阅 ${shortUuid(ch.uuid)} 失败：${e.message}`);
+    }
+  }
+  await readAll();
+  log("=== 枚举完成。如果板子是主动上报的，等 notify 数据即可；如果要先发命令，用上面的发送框。===");
+}
+
+async function readAll() {
+  for (const ch of readableChars) {
+    try {
+      const dv = await ch.readValue();
+      log(`READ ${shortUuid(ch.service.uuid)}/${shortUuid(ch.uuid)} (${dv.byteLength}B)\n  HEX  : ${toHex(dv)}\n  ASCII: ${toAscii(dv)}`);
+    } catch (e) {
+      log(`读取 ${shortUuid(ch.uuid)} 失败：${e.message}`);
+    }
+  }
+}
+
+async function writeCmd() {
+  const idx = $("writeChar").value;
+  const ch = writableChars[idx];
+  if (!ch) return;
+  const raw = $("writeData").value.trim();
+  if (!raw) return;
+  let bytes;
+  if ($("asText").checked) {
+    bytes = new TextEncoder().encode(raw);
+  } else {
+    const parts = raw.split(/[\s,]+/).filter(Boolean);
+    if (parts.some(x => !/^[0-9a-fA-F]{1,2}$/.test(x))) { alert("HEX 格式不对，示例：AA 01 00 55"); return; }
+    bytes = new Uint8Array(parts.map(x => parseInt(x, 16)));
+  }
+  try {
+    if (ch.properties.writeWithoutResponse) await ch.writeValueWithoutResponse(bytes);
+    else await ch.writeValueWithResponse(bytes);
+    log(`WRITE ${shortUuid(ch.uuid)} (${bytes.length}B): ${Array.from(bytes).map(b=>b.toString(16).padStart(2,"0").toUpperCase()).join(" ")}`);
+  } catch (e) {
+    log("写入失败：" + e.message);
+  }
+}
+
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = () => { if (device && device.gatt.connected) device.gatt.disconnect(); };
+$("btnReadAll").onclick = readAll;
+$("btnWrite").onclick = writeCmd;
+$("btnClear").onclick = () => logEl.textContent = "";
+$("btnSave").onclick = () => {
+  const blob = new Blob([logEl.textContent], {type:"text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "ble_log_" + new Date().toISOString().replace(/[:.]/g,"-") + ".txt";
+  a.click();
+};
+
+if (!navigator.bluetooth) {
+  log("!! 当前浏览器不支持 Web Bluetooth，请用 Chrome / Edge 打开。");
+} else {
+  log("就绪。给样机上电（确认在广播），然后点「扫描并连接」。");
+}
+</script>
+</body>
+</html>
